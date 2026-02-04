@@ -473,6 +473,27 @@ async def _delete_msg_safe(msg: Message) -> None:
     except Exception:
         pass
 
+async def _delete_msg_id_safe(chat_id: int, message_id: int) -> None:
+    """Удалить сообщение по ID (если можно)."""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+async def _track_form_message(state: FSMContext, msg: Message | None) -> None:
+    if not msg:
+        return
+    data = await state.get_data()
+    ids = data.get("form_msg_ids", [])
+    ids.append(msg.message_id)
+    await state.update_data(form_msg_ids=ids)
+
+async def _cleanup_form_messages(state: FSMContext, chat_id: int) -> None:
+    data = await state.get_data()
+    for mid in data.get("form_msg_ids", []):
+        await _delete_msg_id_safe(chat_id, mid)
+    await state.update_data(form_msg_ids=[])
+
 class BigProjectCreate(StatesGroup):
     waiting_name = State()
     waiting_type = State()
@@ -535,8 +556,10 @@ async def bigproj_start(m: Message, state: FSMContext):
         me = await get_user_by_tg(db, m.from_user.id)
     if me["role"] not in ("head","developer"):
         await m.answer("Нет доступа."); return
+    await state.update_data(form_msg_ids=[])
     await state.set_state(BigProjectCreate.waiting_name)
-    await m.answer("Название проекта?")
+    prompt = await m.answer("Название проекта?")
+    await _track_form_message(state, prompt)
 
 @router.message(BigProjectCreate.waiting_name)
 async def bigproj_name(m: Message, state: FSMContext):
@@ -546,6 +569,8 @@ async def bigproj_name(m: Message, state: FSMContext):
     при «Проекты» выходим из мастера и открываем корень раздела.
     """
     text = (m.text or "").strip()
+
+    await _track_form_message(state, m)
 
     # 1) Любая команда вида /... — не принимаем как название
     if text.startswith("/"):
@@ -565,8 +590,11 @@ async def bigproj_name(m: Message, state: FSMContext):
 
     # 3) Пустота/мусор – снова попросим ввести название
     if not text:
-        await m.answer("Введите, пожалуйста, <b>название проекта</b> текстом (например: <code>Nora Space</code>).",
-                       parse_mode="HTML")
+        prompt = await m.answer(
+            "Введите, пожалуйста, <b>название проекта</b> текстом (например: <code>Nora Space</code>).",
+            parse_mode="HTML",
+        )
+        await _track_form_message(state, prompt)
         return
 
     # ---- дальше твоя логика создания проекта как была ----
@@ -581,14 +609,16 @@ async def bigproj_name(m: Message, state: FSMContext):
     kb.button(text="монтаж", callback_data="proj:new:type:montage")
     kb.adjust(2)
     await state.set_state(BigProjectCreate.waiting_type)
-    await m.answer("Тип проекта?", reply_markup=kb.as_markup())
+    prompt = await m.answer("Тип проекта?", reply_markup=kb.as_markup())
+    await _track_form_message(state, prompt)
 
 @router.callback_query(F.data.startswith("proj:new:type:"))
 async def bigproj_type(cq: CallbackQuery, state: FSMContext):
     t = cq.data.split(":")[3]
     await state.update_data(prj_type=t)
     await state.set_state(BigProjectCreate.waiting_start)
-    await cq.message.answer("Дата начала (ДД.ММ.ГГГГ)?")
+    prompt = await cq.message.answer("Дата начала (ДД.ММ.ГГГГ)?")
+    await _track_form_message(state, prompt)
     await cq.answer()
 
 def _parse_dmy(s: str) -> date | None:
@@ -602,21 +632,33 @@ def _parse_dmy(s: str) -> date | None:
 async def bigproj_startdate(m: Message, state: FSMContext):
     d = _parse_dmy(m.text or "")
     if not d:
-        await m.answer("Формат даты: ДД.ММ.ГГГГ"); return
+        await _track_form_message(state, m)
+        prompt = await m.answer("Формат даты: ДД.ММ.ГГГГ")
+        await _track_form_message(state, prompt)
+        return
+    await _track_form_message(state, m)
     await state.update_data(start_date=d.isoformat())
     await state.set_state(BigProjectCreate.waiting_deadline)
-    await m.answer("Дедлайн (ДД.ММ.ГГГГ)?")
+    prompt = await m.answer("Дедлайн (ДД.ММ.ГГГГ)?")
+    await _track_form_message(state, prompt)
 
 @router.message(BigProjectCreate.waiting_deadline)
 async def bigproj_deadline(m: Message, state: FSMContext):
     dl = _parse_dmy(m.text or "")
     if not dl:
-        await m.answer("Формат даты: ДД.ММ.ГГГГ"); return
+        await _track_form_message(state, m)
+        prompt = await m.answer("Формат даты: ДД.ММ.ГГГГ")
+        await _track_form_message(state, prompt)
+        return
+
+    await _track_form_message(state, m)
 
     data = await state.get_data()
     start = date.fromisoformat(data["start_date"])
     if dl < start:
-        await m.answer("Дедлайн раньше даты начала — поправь."); return
+        prompt = await m.answer("Дедлайн раньше даты начала — поправь.")
+        await _track_form_message(state, prompt)
+        return
 
     name = data["prj_name"]
     prj_type = data["prj_type"]
@@ -649,6 +691,7 @@ async def bigproj_deadline(m: Message, state: FSMContext):
         """, (pid, prj_type, start.isoformat(), dl.isoformat(), sheet_title))
         await db.commit()
 
+    await _cleanup_form_messages(state, m.chat.id)
     await state.clear()
 
     # 4) спрашиваем про план
@@ -672,9 +715,11 @@ async def proj_plan_add(cq: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
+    await state.update_data(form_msg_ids=[])
     await state.update_data(add_pid=pid)
     await state.set_state(ProjTaskAdd.waiting_text)
-    await cq.message.answer("Опиши задачу одним сообщением:")
+    prompt = await cq.message.answer("Опиши задачу одним сообщением:")
+    await _track_form_message(state, prompt)
     await cq.answer()
 
 @router.callback_query(F.data.startswith("proj:plan_later:"))
@@ -749,7 +794,7 @@ async def proj_summary(cq: CallbackQuery):
     await cq.answer()
 
 # --- выбор исполнителя (отдельный picker, чтобы не мешать существующему assign_user) ---
-async def show_user_picker_project(m_or_cq, page: int, for_tg_id: int):
+async def show_user_picker_project(m_or_cq, page: int, for_tg_id: int) -> Message | None:
     is_cq = isinstance(m_or_cq, CallbackQuery)
     chat_id = m_or_cq.message.chat.id if is_cq else m_or_cq.chat.id
 
@@ -769,9 +814,12 @@ async def show_user_picker_project(m_or_cq, page: int, for_tg_id: int):
     total = len(candidates)
     if total == 0:
         txt = "Нет доступных сотрудников."
-        if is_cq: await m_or_cq.message.edit_text(txt); await m_or_cq.answer()
-        else:     await bot.send_message(chat_id, txt)
-        return
+        if is_cq:
+            msg = await m_or_cq.message.edit_text(txt)
+            await m_or_cq.answer()
+        else:
+            msg = await bot.send_message(chat_id, txt)
+        return msg
 
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages-1))
@@ -790,19 +838,25 @@ async def show_user_picker_project(m_or_cq, page: int, for_tg_id: int):
 
     txt = f"Кто будет делать задачу? (стр {page+1}/{pages})"
     if is_cq:
-        await m_or_cq.message.edit_text(txt, reply_markup=kb.as_markup())
+        msg = await m_or_cq.message.edit_text(txt, reply_markup=kb.as_markup())
         await m_or_cq.answer()
     else:
-        await bot.send_message(chat_id, txt, reply_markup=kb.as_markup())
+        msg = await bot.send_message(chat_id, txt, reply_markup=kb.as_markup())
+    return msg
 
 @router.message(ProjTaskAdd.waiting_text)
 async def proj_task_got_text(m: Message, state: FSMContext):
     text = (m.text or "").strip()
     if len(text) < 2:
-        await m.answer("Слишком коротко, опиши задачу."); return
+        await _track_form_message(state, m)
+        prompt = await m.answer("Слишком коротко, опиши задачу.")
+        await _track_form_message(state, prompt)
+        return
+    await _track_form_message(state, m)
     await state.update_data(add_text=text)
     await state.set_state(ProjTaskAdd.picking_assignee)
-    await show_user_picker_project(m, 0, for_tg_id=m.from_user.id)
+    prompt = await show_user_picker_project(m, 0, for_tg_id=m.from_user.id)
+    await _track_form_message(state, prompt)
 
 @router.callback_query(F.data.startswith("projuser_list:"))
 async def proj_user_list(cq: CallbackQuery, state: FSMContext):
@@ -889,8 +943,9 @@ async def proj_date_pick(cq: CallbackQuery, state: FSMContext):
     kb.button(text="✅ Завершить задачу", callback_data=_proj_done_cb(tid))
     kb.adjust(1)
 
+    await _cleanup_form_messages(state, cq.message.chat.id)
     await state.clear()
-    await cq.message.edit_text("✅ Задача добавлена.", reply_markup=kb.as_markup())
+    await cq.message.answer("✅ Задача добавлена.", reply_markup=kb.as_markup())
     await cq.answer()
 
 @router.callback_query(F.data.startswith("projextend1:"))
