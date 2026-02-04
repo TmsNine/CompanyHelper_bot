@@ -571,7 +571,7 @@ async def bigproj_name(m: Message, state: FSMContext):
 
     # ---- дальше твоя логика создания проекта как была ----
     # сохраняем название в FSM и переводим на шаг выбора типа
-    await state.update_data(proj_name=text)
+    await state.update_data(prj_name=text)
 
     # показываем выбор типа проекта (используй те же кнопки, что уже есть у тебя)
     kb = InlineKeyboardBuilder()
